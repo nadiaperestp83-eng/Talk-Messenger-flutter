@@ -17,6 +17,7 @@ class _IndividualPageState extends State<IndividualPage> {
   final List<MessageModel> _messages = [];
   bool _loading = true;
   bool _hasText = false;
+  RealtimeChannel? _channel;
 
   @override
   void initState() {
@@ -32,6 +33,7 @@ class _IndividualPageState extends State<IndividualPage> {
   void dispose() {
     _messageController.dispose();
     _scrollController.dispose();
+    _channel?.unsubscribe();
     super.dispose();
   }
 
@@ -43,6 +45,7 @@ class _IndividualPageState extends State<IndividualPage> {
           .eq('conversation_id', widget.chatModel.id)
           .order('created_at', ascending: true);
 
+      if (!mounted) return;
       setState(() {
         _messages.clear();
         _messages.addAll(
@@ -52,25 +55,34 @@ class _IndividualPageState extends State<IndividualPage> {
       });
       _scrollToBottom();
     } catch (e) {
-      setState(() => _loading = false);
+      if (mounted) setState(() => _loading = false);
     }
   }
 
   void _subscribeMessages() {
-    Supabase.instance.client
-        .channel('messages:${widget.chatModel.id}')
+    _channel = Supabase.instance.client
+        .channel('room-${widget.chatModel.id}')
         .onPostgresChanges(
           event: PostgresChangeEvent.insert,
           schema: 'public',
           table: 'messages',
-          filter: 'conversation_id=eq.${widget.chatModel.id}',
           callback: (payload) {
-            final msg = MessageModel.fromMap(payload.newRecord);
-            setState(() => _messages.add(msg));
-            _scrollToBottom();
+            if (!mounted) return;
+            final record = payload.newRecord;
+            final convId = record['conversation_id']?.toString();
+            if (convId != widget.chatModel.id.toString()) return;
+
+            final msg = MessageModel.fromMap(record);
+            final alreadyExists = _messages.any((m) => m.id == msg.id);
+            if (!alreadyExists) {
+              setState(() => _messages.add(msg));
+              _scrollToBottom();
+            }
           },
         )
-        .subscribe();
+        .subscribe((status, [error]) {
+          debugPrint('Realtime: $status | $error');
+        });
   }
 
   void _scrollToBottom() {
@@ -95,14 +107,39 @@ class _IndividualPageState extends State<IndividualPage> {
     final userId = Supabase.instance.client.auth.currentUser?.id;
     if (userId == null) return;
 
+    final tempMsg = MessageModel(
+      id: 'temp-${DateTime.now().millisecondsSinceEpoch}',
+      conversationId: widget.chatModel.id,
+      senderId: userId,
+      content: text,
+      type: MessageType.text,
+      status: MessageStatus.sent,
+      createdAt: DateTime.now(),
+    );
+    setState(() => _messages.add(tempMsg));
+    _scrollToBottom();
+
     try {
-      await Supabase.instance.client.from('messages').insert({
-        'conversation_id': widget.chatModel.id,
-        'sender_id': userId,
-        'content': text,
-        'type': 'text',
-        'status': 'sent',
-      });
+      final inserted = await Supabase.instance.client
+          .from('messages')
+          .insert({
+            'conversation_id': widget.chatModel.id,
+            'sender_id': userId,
+            'content': text,
+            'type': 'text',
+            'status': 'sent',
+          })
+          .select()
+          .single();
+
+      if (mounted) {
+        setState(() {
+          final idx = _messages.indexWhere((m) => m.id == tempMsg.id);
+          if (idx != -1) {
+            _messages[idx] = MessageModel.fromMap(inserted);
+          }
+        });
+      }
 
       await Supabase.instance.client
           .from('conversations')
@@ -113,6 +150,9 @@ class _IndividualPageState extends State<IndividualPage> {
           .eq('id', widget.chatModel.id);
     } catch (e) {
       debugPrint('Erro ao enviar: $e');
+      if (mounted) {
+        setState(() => _messages.removeWhere((m) => m.id == tempMsg.id));
+      }
     }
   }
 
@@ -128,7 +168,8 @@ class _IndividualPageState extends State<IndividualPage> {
       backgroundColor: const Color(0xFFECEEF3),
       appBar: AppBar(
         backgroundColor: Colors.white,
-        elevation: 0,
+        elevation: 0.5,
+        shadowColor: Colors.black12,
         leading: IconButton(
           icon: const Icon(Icons.arrow_back, color: Color(0xFF0A84FF)),
           onPressed: () => Navigator.pop(context),
@@ -177,11 +218,15 @@ class _IndividualPageState extends State<IndividualPage> {
         ),
         actions: [
           IconButton(
-            icon: const Icon(Icons.videocam_outlined, color: Color(0xFF0A84FF)),
+            icon: const Icon(Icons.call, color: Color(0xFF0A84FF)),
             onPressed: () {},
           ),
           IconButton(
-            icon: const Icon(Icons.call_outlined, color: Color(0xFF0A84FF)),
+            icon: const Icon(Icons.videocam, color: Color(0xFF0A84FF)),
+            onPressed: () {},
+          ),
+          IconButton(
+            icon: const Icon(Icons.more_vert, color: Colors.black54),
             onPressed: () {},
           ),
         ],
@@ -191,8 +236,7 @@ class _IndividualPageState extends State<IndividualPage> {
           Expanded(
             child: _loading
                 ? const Center(
-                    child: CircularProgressIndicator(
-                        color: Color(0xFF0A84FF)))
+                    child: CircularProgressIndicator(color: Color(0xFF0A84FF)))
                 : ListView.builder(
                     controller: _scrollController,
                     padding: const EdgeInsets.symmetric(
@@ -281,61 +325,75 @@ class _IndividualPageState extends State<IndividualPage> {
   Widget _buildInputBar() {
     return SafeArea(
       child: Container(
-        color: Colors.white,
+        color: const Color(0xFFF0F0F0),
         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
         child: Row(
           crossAxisAlignment: CrossAxisAlignment.end,
           children: [
-            IconButton(
-              icon: const Icon(Icons.add, color: Colors.grey),
-              onPressed: () {},
-            ),
-            IconButton(
-              icon: const Icon(Icons.sticky_note_2_outlined, color: Colors.grey),
-              onPressed: () {},
-            ),
-            IconButton(
-              icon: const Icon(Icons.camera_alt_outlined, color: Colors.grey),
-              onPressed: () {},
-            ),
             Expanded(
               child: Container(
-                constraints: const BoxConstraints(maxHeight: 120),
+                constraints: const BoxConstraints(minHeight: 46),
                 decoration: BoxDecoration(
-                  color: const Color(0xFFF5F5F5),
+                  color: Colors.white,
                   borderRadius: BorderRadius.circular(24),
-                  border: Border.all(color: const Color(0xFFE0E0E0)),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withOpacity(0.05),
+                      blurRadius: 2,
+                      offset: const Offset(0, 1),
+                    ),
+                  ],
                 ),
-                child: TextField(
-                  controller: _messageController,
-                  maxLines: null,
-                  keyboardType: TextInputType.multiline,
-                  textCapitalization: TextCapitalization.sentences,
-                  decoration: const InputDecoration(
-                    hintText: 'Mensagem...',
-                    hintStyle: TextStyle(color: Colors.grey),
-                    border: InputBorder.none,
-                    contentPadding: EdgeInsets.symmetric(
-                        horizontal: 16, vertical: 10),
-                  ),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.center,
+                  children: [
+                    IconButton(
+                      icon: const Icon(Icons.emoji_emotions_outlined, color: Color(0xFF8E8E93), size: 24),
+                      onPressed: () {},
+                    ),
+                    Expanded(
+                      child: TextField(
+                        controller: _messageController,
+                        minLines: 1,
+                        maxLines: 5,
+                        keyboardType: TextInputType.multiline,
+                        textCapitalization: TextCapitalization.sentences,
+                        style: const TextStyle(fontSize: 16),
+                        decoration: const InputDecoration(
+                          hintText: 'Mensagem',
+                          border: InputBorder.none,
+                          contentPadding: EdgeInsets.symmetric(vertical: 10),
+                          isDense: true,
+                        ),
+                      ),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.attach_file, color: Color(0xFF8E8E93), size: 22),
+                      onPressed: () {},
+                    ),
+                    if (!_hasText)
+                      IconButton(
+                        icon: const Icon(Icons.camera_alt_outlined, color: Color(0xFF8E8E93), size: 22),
+                        onPressed: () {},
+                      ),
+                  ],
                 ),
               ),
             ),
             const SizedBox(width: 8),
             GestureDetector(
               onTap: _hasText ? _sendMessage : null,
-              child: AnimatedContainer(
-                duration: const Duration(milliseconds: 200),
-                width: 44,
-                height: 44,
-                decoration: BoxDecoration(
-                  color: const Color(0xFF0A84FF),
+              child: Container(
+                height: 46,
+                width: 46,
+                decoration: const BoxDecoration(
+                  color: Color(0xFF0A84FF),
                   shape: BoxShape.circle,
                 ),
                 child: Icon(
                   _hasText ? Icons.send_rounded : Icons.mic,
                   color: Colors.white,
-                  size: 20,
+                  size: 22,
                 ),
               ),
             ),
